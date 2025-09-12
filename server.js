@@ -1,61 +1,127 @@
+// server.js
+// Secure backend for Eskola RolePlayBot (OpenAI proxy with sane CORS)
+
 import express from "express";
-import fetch from "node-fetch";
 import cors from "cors";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
 
-// 🔒 Allow your Squarespace site to call this server.
-// Replace with your real domain when you know it, e.g. https://www.eskolaroofing.com
-const allowedOrigins = [
-  "https://www.squarespace.com", // Squarespace editor preview
-  "https://*.squarespace.com",    // some templates render from a subdomain
-  "https://your-site-domain.com"  // <- replace with your real site domain later
+// ───────────────────────────────────────────────────────────────────────────────
+// CORS: permissive in DEV for local HTML testing; strict in PROD for Squarespace
+// ───────────────────────────────────────────────────────────────────────────────
+const isProd = process.env.NODE_ENV === "production";
+
+/**
+ * Allowed web origins when deployed.
+ * Adjust these to match your actual live domain(s) before launch.
+ * - Keep Squarespace domains
+ * - Replace the eskola.com entries with your real domain(s)
+ */
+const PROD_ALLOWED_ORIGINS = [
+  "https://static1.squarespace.com",
+  "https://*.squarespace.com",
+  "https://*.squarespace-cdn.com",
+  "https://eskola.com",          // ← replace if different
+  "https://www.eskola.com"       // ← replace if different
 ];
 
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // allow server-to-server / curl
-    const ok = allowedOrigins.some(o => {
-      if (o.includes("*")) {
-        const regex = new RegExp("^" + o.replace(/\./g,"\\.").replace("*",".*") + "$");
-        return regex.test(origin);
-      }
-      return origin === o;
-    });
-    cb(ok ? null : new Error("CORS blocked"), ok);
+/**
+ * Extra dev origins so you can test locally via a simple server.
+ * (Common local ports included; modify as needed.)
+ */
+const DEV_EXTRA_ORIGINS = [
+  "null",                        // allows file:// (opening a local HTML file)
+  "http://localhost:3000",
+  "http://localhost:5173",
+  "http://127.0.0.1:5500",
+  "http://localhost:5500"
+];
+
+/**
+ * Build the final list based on environment.
+ * In DEV: prod list + dev extras
+ * In PROD: prod list only (NO "null", NO localhost)
+ */
+const ALLOWED_ORIGINS = isProd
+  ? PROD_ALLOWED_ORIGINS
+  : [...PROD_ALLOWED_ORIGINS, ...DEV_EXTRA_ORIGINS];
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // Allow server-to-server and tools without Origin
+      if (!origin) return cb(null, true);
+
+      // Exact match or wildcard (*.domain.com)
+      const ok = ALLOWED_ORIGINS.some((o) => {
+        if (o === origin) return true;
+        if (o.includes("*")) {
+          const re = new RegExp("^" + o.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
+          return re.test(origin);
+        }
+        return false;
+      });
+
+      return cb(ok ? null : new Error(`CORS blocked for origin: ${origin}`), ok);
+    },
+    credentials: false
+  })
+);
+
+// Optional: friendly CORS error body (instead of default HTML)
+app.use((err, req, res, next) => {
+  if (err && /CORS blocked/.test(err.message)) {
+    return res.status(403).json({ error: "CORS blocked", origin: req.headers.origin || null });
   }
-}));
+  return next(err);
+});
 
-app.get("/health", (_, res) => res.json({ ok: true }));
+// ───────────────────────────────────────────────────────────────────────────────
+// Health check
+// ───────────────────────────────────────────────────────────────────────────────
+app.get("/health", (_req, res) => res.json({ ok: true, env: isProd ? "production" : "development" }));
 
+// ───────────────────────────────────────────────────────────────────────────────
+// OpenAI proxy route
+// ───────────────────────────────────────────────────────────────────────────────
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 app.post("/chat", async (req, res) => {
   try {
-    const { messages, scenario } = req.body;
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ error: "Missing OPENAI_API_KEY on the server." });
+    }
 
-    // System prompt = persona + Eskola HELP framework
+    const { messages, scenario } = req.body || {};
+    if (!Array.isArray(messages) || !scenario || !scenario.name || !scenario.company) {
+      return res.status(400).json({
+        error: "Invalid payload. Expected { messages: [], scenario: { name, company } }"
+      });
+    }
+
+    // System prompt aligned to Eskola HELP methodology & GTM focus
     const systemPrompt = `
 You are roleplaying as ${scenario.name} from ${scenario.company}.
-Behave like a real buyer in commercial roofing. Sometimes receptive, sometimes resistant.
-Evaluate the salesperson using Eskola's H.E.L.P. process:
-- Hello: Did they introduce themselves, ask permission, and establish purpose?
-- Educate: Did they ask good qualifying questions to discover needs, asset profile, decision process?
-- Leverage: Did they articulate value (safety, warranty, risk reduction, SHIELD maintenance, inspections, service responsiveness)?
+Behave like a real commercial-roofing buyer. Sometimes receptive, sometimes resistant.
+Respond to a salesperson using Eskola's H.E.L.P. framework:
+- Hello: Did they introduce themselves, ask permission, and set a purpose?
+- Educate: Did they ask good qualifying questions (asset profile, decision process, timelines, budget)?
+- Leverage: Did they articulate Eskola value (safety, warranty, SHIELD maintenance, inspections, responsiveness, risk reduction)?
 - Prove: Did they propose clear next steps (site walk, SHIELD inspection, proposal meeting)?
-Keep replies concise and realistic. Offer objections now and then.
-At the end of each reply, add a coaching line that starts with "Coach:" telling them what they did well and what to try next per H.E.L.P.
-    `;
+Keep replies concise, natural, and realistic. Offer objections periodically.
+At the end of every reply, add a coaching line that starts with "Coach:" giving feedback on what they did well and what to try next using H.E.L.P.
+    `.trim();
 
-    const apiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+    const oaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${OPENAI_API_KEY}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini", // fast & cost-efficient; you can switch to gpt-4 if you want
+        model: "gpt-4o-mini",         // swap to "gpt-4" if you prefer
         temperature: 0.9,
         messages: [
           { role: "system", content: systemPrompt },
@@ -64,17 +130,25 @@ At the end of each reply, add a coaching line that starts with "Coach:" telling 
       })
     });
 
-    const data = await apiRes.json();
-    if (apiRes.status >= 400) {
-      console.error("OpenAI error:", data);
+    const data = await oaiRes.json();
+
+    if (!oaiRes.ok) {
+      // bubble up OpenAI error details for easier debugging
       return res.status(500).json({ error: "OpenAI API error", details: data });
     }
+
     return res.json(data);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Server error" });
+  } catch (err) {
+    console.error("Server error:", err);
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
+// ───────────────────────────────────────────────────────────────────────────────
+// Start server
+// ───────────────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Eskola RolePlayBot backend running on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`✅ Eskola RolePlayBot backend running on port ${PORT} (${isProd ? "PROD" : "DEV"})`);
+  console.log("Allowed origins:", ALLOWED_ORIGINS.join(", "));
+});
