@@ -1,5 +1,6 @@
 // server.js
-// Eskola RolePlayBot backend — natural, non-repetitive personas with receptivity & drift
+// Eskola RolePlayBot backend — persona realism + receptivity + anti-repeat
+// (FIX: filter out non-OpenAI roles like "coach" before calling OpenAI)
 
 import express from "express";
 import cors from "cors";
@@ -8,9 +9,8 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json());
 
-// ─────────── CORS (safe for prod, optional local-file testing) ───────────
+// ─────────── CORS ───────────
 const ALLOW_LOCAL_FILE = (process.env.ALLOW_LOCAL_FILE || "true").toLowerCase() === "true";
-
 const PROD_ALLOWED_ORIGINS = [
   "https://static1.squarespace.com",
   "https://*.squarespace.com",
@@ -18,17 +18,15 @@ const PROD_ALLOWED_ORIGINS = [
   "https://eskola.com",
   "https://www.eskola.com"
 ];
-
 const DEV_ALLOWED = ALLOW_LOCAL_FILE
   ? ["null", "http://localhost:3000", "http://127.0.0.1:5500", "http://localhost:5500"]
   : [];
-
 const ALLOWED_ORIGINS = [...PROD_ALLOWED_ORIGINS, ...DEV_ALLOWED];
 
 app.use(
   cors({
     origin: (origin, cb) => {
-      if (!origin) return cb(null, true); // server-to-server tools
+      if (!origin) return cb(null, true);
       const ok = ALLOWED_ORIGINS.some((o) => {
         if (o === origin) return true;
         if (o.includes("*")) {
@@ -54,23 +52,26 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, allowLocalFile: ALLOW_LOCAL_FILE, allowedOrigins: ALLOWED_ORIGINS });
 });
 
-// ─────────── OpenAI proxy with persona + receptivity + anti-repetition ───────────
+// ─────────── OpenAI proxy ───────────
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const MODEL = process.env.MODEL || "gpt-3.5-turbo"; // widely available
+const MODEL = process.env.MODEL || "gpt-3.5-turbo";
 
-// Pull last few assistant lines to avoid exact repeats
+// Use only roles OpenAI supports
+const OPENAI_ROLES = new Set(["system", "assistant", "user"]);
+
+// Pull last assistant lines to discourage repeats
 function antiRepeatList(messages, maxChars = 1200) {
   const last = [...messages].reverse().filter(m => m.role === "assistant").slice(0, 6);
   let text = last.map(m => m.content).join(" • ");
   if (text.length > maxChars) text = text.slice(-maxChars);
-  return text;
+  return text || "(none)";
 }
 
 function receptivityTuning(persona, dial) {
   const d = Math.max(0, Math.min(3, Number(dial) || 0));
   const map = {
     cold_prospect: [
-      "Ultra-guarded: 1 short sentence, no proactive questions; defaults to deflections; only softens after clear H (permission) + E (one relevant qualifying question).",
+      "Ultra-guarded: 1 short sentence, no proactive questions; defaults to deflections; only softens after clear H (permission) + E (relevant qualifying question).",
       "Guarded: brief replies; rarely asks questions; may offer a tiny clarifier if rep shows strong H+E.",
       "Balanced: still brief but cooperative; can ask one short clarifier; open to a very small next step if value is explicit.",
       "Open: conversational; may ask a few questions; receptive to a low-friction next step."
@@ -103,10 +104,16 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    // style.quirk (string), style.seed (string), style.drift (0..0.3)
+    // Filter out any non-OpenAI roles (e.g., 'coach')
+    const sanitizedMessages = messages
+      .filter(m => OPENAI_ROLES.has(m.role))
+      .map(m => ({ role: m.role, content: m.content }));
+
+    const diversityBlock = antiRepeatList(sanitizedMessages);
+
     const quirk = (style?.quirk || "curt and to the point").toString();
     const seed = (style?.seed || "session").toString();
-    const drift = Math.max(0, Math.min(0.35, Number(style?.drift || 0))); // chance to include a brief human aside
+    const drift = Math.max(0, Math.min(0.35, Number(style?.drift || 0)));
 
     const basePersona = {
       cold_prospect: `
@@ -125,8 +132,6 @@ app.post("/chat", async (req, res) => {
 - Open to SHIELD upsell when framed as risk reduction and warranty health.`
     };
 
-    const diversityBlock = antiRepeatList(messages);
-
     const systemPrompt = `
 You are roleplaying as ${scenario.name} from ${scenario.company}.
 Persona rules:
@@ -138,12 +143,12 @@ ${receptivityTuning(scenario.persona, receptivity)}
 Session flavor (keep subtle & consistent):
 - Seed: ${seed}
 - Quirk: ${quirk}
-- Topic drift budget: up to ${(drift * 100).toFixed(0)}% of turns may include a tiny aside (one short clause) if rapport allows; remain professional.
+- Topic drift budget: up to ${(drift * 100).toFixed(0)}% of turns may include a tiny aside if rapport allows; remain professional.
 
 Diversity & realism:
-- Vary sentence length, tone, and cadence. Use natural contractions and hedges (“I’m not sure…”, “honestly,” “right now,” “to be candid,” etc.).
-- Never reuse exact phrasings from your prior turns in this chat. Avoid these recent assistant phrases verbatim: ${diversityBlock || "(none)"}
-- Don’t sound templated. If you refuse or deflect, do it in different ways across turns.
+- Vary sentence length, tone, and cadence. Use natural contractions and hedges.
+- Never reuse exact phrasings from your prior turns in this chat. Avoid verbatim from: ${diversityBlock}
+- Don’t sound templated. If you refuse or deflect, vary how you do it.
 
 Eskola alignment:
 - Evaluate the rep with H.E.L.P.: Hello (permission), Educate (smart qualification—asset profile, decision process, timelines, budget), Leverage (value: safety, warranty compliance, SHIELD biannual inspections & documentation, response time, lifecycle cost), Prove (clear next step: site walk, SHIELD inspection, brief scheduling call).
@@ -170,7 +175,7 @@ FORMAT:
         frequency_penalty: 0.7,
         messages: [
           { role: "system", content: systemPrompt },
-          ...messages
+          ...sanitizedMessages
         ]
       })
     });
