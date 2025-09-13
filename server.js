@@ -1,5 +1,5 @@
 // server.js
-// Eskola RolePlayBot backend — scoped CORS + persona realism + receptivity dial
+// Eskola RolePlayBot backend — natural, non-repetitive personas with receptivity & drift
 
 import express from "express";
 import cors from "cors";
@@ -8,7 +8,7 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json());
 
-// ─────────── CORS (safe for prod, with optional local file testing) ───────────
+// ─────────── CORS (safe for prod, optional local-file testing) ───────────
 const ALLOW_LOCAL_FILE = (process.env.ALLOW_LOCAL_FILE || "true").toLowerCase() === "true";
 
 const PROD_ALLOWED_ORIGINS = [
@@ -49,92 +49,111 @@ app.use((err, req, res, next) => {
   return next(err);
 });
 
-// ───────────────── Health ─────────────────
+// ─────────── Health ───────────
 app.get("/health", (_req, res) => {
   res.json({ ok: true, allowLocalFile: ALLOW_LOCAL_FILE, allowedOrigins: ALLOWED_ORIGINS });
 });
 
-// ─────────── OpenAI proxy with persona + receptivity tuning ───────────
+// ─────────── OpenAI proxy with persona + receptivity + anti-repetition ───────────
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const MODEL = process.env.MODEL || "gpt-3.5-turbo"; // compatible & cost-friendly
+const MODEL = process.env.MODEL || "gpt-3.5-turbo"; // widely available
+
+// Pull last few assistant lines to avoid exact repeats
+function antiRepeatList(messages, maxChars = 1200) {
+  const last = [...messages].reverse().filter(m => m.role === "assistant").slice(0, 6);
+  let text = last.map(m => m.content).join(" • ");
+  if (text.length > maxChars) text = text.slice(-maxChars);
+  return text;
+}
 
 function receptivityTuning(persona, dial) {
-  // dial: 0 Guarded, 1 Cool, 2 Neutral, 3 Warm
+  const d = Math.max(0, Math.min(3, Number(dial) || 0));
   const map = {
     cold_prospect: [
-      "Ultra-guarded: 1 short sentence, do NOT ask questions proactively. Default to deflections. Only soften after the rep clearly does H (permission) + E (1 relevant qualifying question).",
-      "Guarded: brief replies, rarely ask questions. Consider a short clarifying remark only if rep shows strong H+E.",
-      "Balanced: brief but cooperative; can ask 1 short clarifying question; open to a tiny next step if value is clear.",
-      "Open: conversational; may ask questions; receptive to small, low-friction next steps."
+      "Ultra-guarded: 1 short sentence, no proactive questions; defaults to deflections; only softens after clear H (permission) + E (one relevant qualifying question).",
+      "Guarded: brief replies; rarely asks questions; may offer a tiny clarifier if rep shows strong H+E.",
+      "Balanced: still brief but cooperative; can ask one short clarifier; open to a very small next step if value is explicit.",
+      "Open: conversational; may ask a few questions; receptive to a low-friction next step."
     ],
     qualified_lead: [
-      "Guarded-analytical: terse, ask for proof only if rep earns it; keep pressure on clarity.",
-      "Cool-analytical: selective questions; push on SLA/safety/warranty.",
-      "Neutral-analytical: normal level of questions; compare options.",
+      "Guarded-analytical: terse; asks for proof only if rep earns it; pushes for clarity.",
+      "Cool-analytical: selective questions; pressure on SLA/safety/warranty.",
+      "Neutral-analytical: normal questions; compares options fairly.",
       "Warm-analytical: collaborative; ready to advance with a clear next step."
     ],
     existing_customer: [
-      "Guarded-practical: polite but brief; surface a light concern; avoid extra steps until value is explicit.",
-      "Cool-practical: cooperative; willing to discuss timelines and simple next steps.",
-      "Neutral-practical: friendly; open to SHIELD talk with risk/warranty framing.",
-      "Warm-practical: positive; likely to agree to inspection/site walk."
+      "Guarded-practical: polite but brief; raises a small concern; avoids extra steps until value is explicit.",
+      "Cool-practical: cooperative; open to schedule talk and simple next steps.",
+      "Neutral-practical: friendly; receptive to SHIELD framed as risk/warranty protection.",
+      "Warm-practical: positive; likely to accept inspection/site walk."
     ]
   };
-  const arr = map[persona] || map.cold_prospect;
-  return arr[Math.max(0, Math.min(3, Number(dial) || 0))];
+  const list = map[persona] || map.cold_prospect;
+  return list[d];
 }
 
 app.post("/chat", async (req, res) => {
   try {
     if (!OPENAI_API_KEY) return res.status(500).json({ error: "Missing OPENAI_API_KEY on the server." });
 
-    const { messages, scenario, receptivity } = req.body || {};
+    const { messages, scenario, receptivity, style } = req.body || {};
     if (!Array.isArray(messages) || !scenario?.name || !scenario?.company || !scenario?.persona) {
       return res.status(400).json({
-        error: "Invalid payload. Expected { messages: [], scenario: { name, company, persona }, receptivity }"
+        error: "Invalid payload. Expected { messages: [], scenario: { name, company, persona }, receptivity, style }"
       });
     }
+
+    // style.quirk (string), style.seed (string), style.drift (0..0.3)
+    const quirk = (style?.quirk || "curt and to the point").toString();
+    const seed = (style?.seed || "session").toString();
+    const drift = Math.max(0, Math.min(0.35, Number(style?.drift || 0))); // chance to include a brief human aside
 
     const basePersona = {
       cold_prospect: `
 - Keep it short (often 1 sentence). Guarded, busy, skeptical.
-- Do NOT ask questions proactively unless the rep demonstrates BOTH: 
-  (1) a clear permission-based opener (Hello) AND 
-  (2) a crisp, relevant qualifying question (Educate).
-- Default to deflections: “We’re covered,” “No budget,” “Not a priority,” “Send something.” 
-- Only soften a little if H+E are clearly met; still avoid volunteering details.`,
+- Do NOT ask questions proactively unless BOTH are true:
+  (1) the rep uses a clear permission-based opener (Hello), and
+  (2) the rep asks one crisp, relevant qualifying question (Educate).
+- Default to deflections: “We’re covered,” “No budget,” “Not a priority,” “Send something.”
+- Only soften after clear H+E; still avoid volunteering details.`,
       qualified_lead: `
 - Engaged but discerning. Probe for proof (response times, safety/warranty, scope clarity, cost vs value).
 - Compare vendors. Advance only if next steps are clear and business-relevant.`,
       existing_customer: `
 - Friendly and practical; reference prior work/inspections.
 - Raise one light concern (e.g., response time) but remain collaborative.
-- Open to SHIELD upsell if framed as risk reduction and warranty health.`
+- Open to SHIELD upsell when framed as risk reduction and warranty health.`
     };
+
+    const diversityBlock = antiRepeatList(messages);
 
     const systemPrompt = `
 You are roleplaying as ${scenario.name} from ${scenario.company}.
-Persona:
+Persona rules:
 ${basePersona[scenario.persona] || basePersona.cold_prospect}
 
-Receptivity tuning (dial=${receptivity}):
+Receptivity tuning (0..3 = guarded→warm; current=${receptivity}):
 ${receptivityTuning(scenario.persona, receptivity)}
 
-Follow Eskola’s H.E.L.P. framework in your evaluation:
-- Hello: permission & purpose
-- Educate: smart qualification (asset profile, decision process, timelines, budget)
-- Leverage: Eskola value (safety, warranty compliance, SHIELD biannual inspections & documentation, response time, lifecycle cost)
-- Prove: propose or accept clear next steps (site walk, SHIELD inspection, brief scheduling call)
+Session flavor (keep subtle & consistent):
+- Seed: ${seed}
+- Quirk: ${quirk}
+- Topic drift budget: up to ${(drift * 100).toFixed(0)}% of turns may include a tiny aside (one short clause) if rapport allows; remain professional.
 
-STYLE:
-- Natural, realistic buyer language. Keep replies concise.
-- Use objections appropriate to the persona. Avoid caricature.
+Diversity & realism:
+- Vary sentence length, tone, and cadence. Use natural contractions and hedges (“I’m not sure…”, “honestly,” “right now,” “to be candid,” etc.).
+- Never reuse exact phrasings from your prior turns in this chat. Avoid these recent assistant phrases verbatim: ${diversityBlock || "(none)"}
+- Don’t sound templated. If you refuse or deflect, do it in different ways across turns.
+
+Eskola alignment:
+- Evaluate the rep with H.E.L.P.: Hello (permission), Educate (smart qualification—asset profile, decision process, timelines, budget), Leverage (value: safety, warranty compliance, SHIELD biannual inspections & documentation, response time, lifecycle cost), Prove (clear next step: site walk, SHIELD inspection, brief scheduling call).
+- Tie “Leverage” to business impact. Accept small next steps when appropriate.
 
 FORMAT:
-1) First, ONLY your customer reply (1–3 sentences; for cold prospects, often 1 sentence).
-2) New line: "Coach: ..." — give 1–2 sentences of coaching: 
-   - Did they follow H/E/L/P?
-   - What is the single best next move (permission line, one qualifying question, a value angle, or a concrete next step)?
+1) First, ONLY your customer reply (1–3 sentences; for cold prospects, usually 1 sentence).
+2) New line: "Coach: ..." — 1–2 sentences:
+   • Did they follow H/E/L/P?
+   • What single next move should they try (permission line, one qualifying question, a value angle, or a concrete next step)?
 `.trim();
 
     const oaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -145,7 +164,10 @@ FORMAT:
       },
       body: JSON.stringify({
         model: MODEL,
-        temperature: 0.85,
+        temperature: 0.98,
+        top_p: 0.9,
+        presence_penalty: 0.9,
+        frequency_penalty: 0.7,
         messages: [
           { role: "system", content: systemPrompt },
           ...messages
